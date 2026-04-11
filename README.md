@@ -28,30 +28,33 @@
 
 结果：spatial=32 时 ~28 TFLOPS，cuDNN ~83 TFLOPS（**33%**）
 
-### V1: L2 Swizzle
+### V1: L2 Grouped Ordering (Swizzle)
 
-仿照 matmul tutorial 加入 grouped ordering：
-- `GROUP_SIZE_M` 参数，把 program 按 group 打包成正方形，提升 L2 命中率
-- autotune 搜索 GROUP_SIZE_M in {1, 4, 8}
+**问题：行主序的 tile 调度浪费 L2 cache**
 
-结果：基本无提升（+0~3%）。原因：K 太小（864），L2 reuse 机会本来就少，瓶颈不在 L2 带宽而在 K 循环内的整数除法和 mask 开销。
+GEMM 视角下，每个 block 需要 A 矩阵（weight）的一行和 B 矩阵（input）的一列。
+假设 `pid = pid_m * num_pid_n + pid_n`，相邻 pid 沿 N 方向走完一整行。
 
-### V2: 显式 Zero-Pad + Weight 2D Reshape + K 循环重构 (当前版本)
+一个 wave 同时有 ~100 个 block 在跑时：
+- 行主序：100 个 block 覆盖 1 行 M × 100 列 N → 共享 A 的 1 行（好），但要读 B 的 100 个不同列（差）→ 总共加载 **1 + 100 = 101 个 tile**
+- Grouped ordering（GROUP_SIZE_M=10）：100 个 block 覆盖 10 行 × 10 列的正方形 → 共享 A 的 10 行和 B 的 10 列 → 总共加载 **10 + 10 = 20 个 tile**
 
-三个优化同时实施：
+同样 100 个 block，L2 需要 hold 的数据量少了 **5 倍**。
+
+**实现**：把 program 按 GROUP_SIZE_M 行打包成 group，group 内部先沿 M 方向走完再换列。autotune 搜索 GROUP_SIZE_M in {1, 4, 8}。
+
+**结果**：基本无提升（+0~3%）。原因：K 太小（864），整个 K 循环很快就结束，L2 里 hold 的数据总量远没到 L2 容量瓶颈（H100 L2 = 50MB），不会发生 cache eviction，所以减少 tile 数没有实际收益。瓶颈在 K 循环内的整数除法和 mask 开销。
+
+### V2: 显式 Zero-Pad + Weight 2D Reshape (当前版本)
+
+两个优化同时实施：
 
 **A. 显式 Zero-Pad（消除 d/h/w mask）**
 - wrapper 里用 `F.pad` 预先 pad 输入
 - kernel 内删掉 `pad_d/h/w` 参数和 3 个空间范围检查
 - input_mask 从 5 个 AND 降到 2 个
 
-**B. K 循环重构（消除循环内整数除法）**
-- `BLOCK_K = next_pow2(kD*kH*kW)` = 32（对 3x3x3）
-- `rk -> (rk_d, rk_h, rk_w)` 解码在循环外只算一次
-- 空间地址 `d_in/h_in/w_in` 和 base pointer 也只算一次
-- 外层循环按 `c_in` 推进，循环体只剩 2 个 load + 1 个 dot，**0 次整数除法**
-
-**C. Weight 2D Reshape（消除 4 个 weight stride）**
+**B. Weight 2D Reshape（消除 4 个 weight stride）**
 - `weight.view(C_out, -1)`，kernel 内 weight 地址 = `base + c * KDHW`
 - 删掉 `weight_stride_ic/kd/kh/kw` 四个参数
 
@@ -65,6 +68,12 @@
 | 48 | 141.6 | 27.8 | 80.0 | **2.9x** | 56% |
 
 spatial=32 时达到 cuDNN 的 **93%**。
+
+### Benchmark 结果图
+
+![Symmetric benchmark](conv3d-symmetric-N2-Cin32-Cout64-k3.png)
+
+![Realistic benchmark](conv3d-realistic-N2-Cin32-Cout64-k3.png)
 
 ## 已知问题
 

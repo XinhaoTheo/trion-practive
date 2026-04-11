@@ -1,5 +1,5 @@
 """
-Triton Conv3d 实现 — 从零开始学习 Triton 编写 3D 卷积
+Triton Conv3d 实现
 =======================================================
 
 学习路径: Vector Add → MatMul → im2col + MatMul = Conv3d
@@ -77,23 +77,24 @@ import triton.language as tl
 #   这些参数变化时, autotune 会重新搜索最优配置 (并缓存结果)
 
 def get_autotune_configs():
-    """BLOCK_K 不再 autotune, 由 wrapper 根据 kernel size 计算。"""
+    """autotune BLOCK_M/N/K + GROUP_SIZE_M。"""
     configs = []
     for BM in [32, 64, 128]:
         for BN in [32, 64, 128]:
-            for GM in [1, 4, 8]:
-                for num_warps in [4, 8]:
-                    for num_stages in [2, 3, 4]:
-                        if BM * BN > 128 * 128:
-                            continue
-                        configs.append(
-                            triton.Config(
-                                {"BLOCK_M": BM, "BLOCK_N": BN,
-                                 "GROUP_SIZE_M": GM},
-                                num_warps=num_warps,
-                                num_stages=num_stages,
+            for BK in [32, 64]:
+                for GM in [1, 4, 8]:
+                    for num_warps in [4, 8]:
+                        for num_stages in [2, 3, 4]:
+                            if BM * BN > 128 * 128:
+                                continue
+                            configs.append(
+                                triton.Config(
+                                    {"BLOCK_M": BM, "BLOCK_N": BN,
+                                     "BLOCK_K": BK, "GROUP_SIZE_M": GM},
+                                    num_warps=num_warps,
+                                    num_stages=num_stages,
+                                )
                             )
-                        )
     return configs
 
 
@@ -152,7 +153,7 @@ def conv3d_kernel(
     HAS_BIAS: tl.constexpr,
     BLOCK_M: tl.constexpr,      # 输出通道方向的 block
     BLOCK_N: tl.constexpr,      # 输出空间位置方向的 block
-    BLOCK_K: tl.constexpr,      # = next_pow2(kD * kH * kW), 由 wrapper 设定
+    BLOCK_K: tl.constexpr,      # reduction 方向的 block, autotune 搜索
     GROUP_SIZE_M: tl.constexpr,
 ):
     """
@@ -201,57 +202,50 @@ def conv3d_kernel(
     h_out_idx = hw_idx // out_width
     w_out_idx = hw_idx % out_width
 
-    # 输入空间起点 (输入已被预先 zero-pad, 所以不再减 pad)
-    d_base = d_out_idx * stride_d   # (BLOCK_N,)
-    h_base = h_out_idx * stride_h
-    w_base = w_out_idx * stride_w
-
-    # ----- 3. 重构的 K 循环 -----
-    # BLOCK_K = next_pow2(kD*kH*kW), 外层循环走 c_in
-    # rk 解码只在循环外算一次, 彻底消除循环内的整数除法
-    KDHW = kernel_d * kernel_h * kernel_w
-    KHW = kernel_h * kernel_w
-    rk = tl.arange(0, BLOCK_K)              # (BLOCK_K,)
-    rk_valid = rk < KDHW                     # 尾部 padding mask
-    rk_d = rk // KHW
-    rk_h = (rk % KHW) // kernel_w
-    rk_w = rk % kernel_w
-
-    # 输入空间地址, 只在循环外算一次 (BLOCK_K, BLOCK_N)
-    d_in = d_base[None, :] + rk_d[:, None]
-    h_in = h_base[None, :] + rk_h[:, None]
-    w_in = w_base[None, :] + rk_w[:, None]
-
-    # boundary mask
-    mask_m = rm < out_channels              # (BLOCK_M,)
-    mask_n = rn < total_out                 # (BLOCK_N,)
-
-    # base pointers (不含 c_in 偏移, 循环内只加一个标量)
-    input_base_ptrs = (input_ptr
-                      + n_idx[None, :] * input_stride_n
-                      + d_in * input_stride_d
-                      + h_in * input_stride_h
-                      + w_in * input_stride_w)           # (BLOCK_K, BLOCK_N)
-    weight_base_ptrs = (weight_ptr
-                       + rm[:, None] * weight_stride_oc
-                       + rk[None, :])                     # (BLOCK_M, BLOCK_K)
-
-    input_mask = rk_valid[:, None] & mask_n[None, :]      # (BLOCK_K, BLOCK_N)
-    weight_mask = mask_m[:, None] & rk_valid[None, :]      # (BLOCK_M, BLOCK_K)
-
+    # ----- 3. Reduction 循环: 沿 K = C_in * kD * kH * kW 累加 -----
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-    # 主循环: 每次推进一个 c_in, 循环体内 0 次整数除法
-    for c in range(0, in_channels):
-        w = tl.load(weight_base_ptrs + c * KDHW,
-                    mask=weight_mask, other=0.0)           # (BLOCK_M, BLOCK_K)
-        x = tl.load(input_base_ptrs + c * input_stride_c,
-                    mask=input_mask, other=0.0)            # (BLOCK_K, BLOCK_N)
+    K = in_channels * kernel_d * kernel_h * kernel_w
+    KHW = kernel_h * kernel_w
+    KDHW = kernel_d * KHW
+
+    for k_start in range(0, K, BLOCK_K):
+        rk = k_start + tl.arange(0, BLOCK_K)   # (BLOCK_K,)
+
+        # 从 rk 解码出 (c_in, kd, kh, kw)
+        rk_c = rk // KDHW
+        rk_rem = rk % KDHW
+        rk_d = rk_rem // KHW
+        rk_hk = rk_rem % KHW
+        rk_h = rk_hk // kernel_w
+        rk_w = rk_hk % kernel_w
+
+        # 加载权重 (2D layout: weight_ptr + rm * stride_oc + rk)
+        weight_ptrs = (weight_ptr
+                      + rm[:, None] * weight_stride_oc
+                      + rk[None, :])
+        weight_mask = (rm[:, None] < out_channels) & (rk[None, :] < K)
+        w = tl.load(weight_ptrs, mask=weight_mask, other=0.0)
+
+        # 加载输入 (已预先 zero-pad, 不需要 d/h/w 范围检查)
+        d_in = d_out_idx[None, :] * stride_d + rk_d[:, None]
+        h_in = h_out_idx[None, :] * stride_h + rk_h[:, None]
+        w_in = w_out_idx[None, :] * stride_w + rk_w[:, None]
+
+        input_ptrs = (input_ptr
+                     + n_idx[None, :] * input_stride_n
+                     + rk_c[:, None] * input_stride_c
+                     + d_in * input_stride_d
+                     + h_in * input_stride_h
+                     + w_in * input_stride_w)
+        input_mask = (rk[:, None] < K) & (rn[None, :] < total_out)
+        x = tl.load(input_ptrs, mask=input_mask, other=0.0)
+
         acc = tl.dot(w, x, acc)
 
     # ----- 4. bias -----
     if HAS_BIAS:
-        bias = tl.load(bias_ptr + rm, mask=mask_m, other=0.0)
+        bias = tl.load(bias_ptr + rm, mask=rm < out_channels, other=0.0)
         acc += bias[:, None]
 
     # ----- 5. store -----
@@ -263,7 +257,7 @@ def conv3d_kernel(
                   + d_out_idx[None, :] * output_stride_d
                   + h_out_idx[None, :] * output_stride_h
                   + w_out_idx[None, :] * output_stride_w)
-    output_mask = mask_m[:, None] & mask_n[None, :]
+    output_mask = (rm[:, None] < out_channels) & (rn[None, :] < total_out)
 
     tl.store(output_ptrs, c_out, mask=output_mask)
 
@@ -332,10 +326,6 @@ def triton_conv3d(
     M = C_out
     total_N = N * D_out * H_out * W_out
 
-    # === 优化 B: BLOCK_K 由 kernel size 决定, 不再 autotune ===
-    KDHW = kD * kH * kW
-    BLOCK_K = max(triton.next_power_of_2(KDHW), 16)
-
     # --- 准备 bias ---
     HAS_BIAS = bias is not None
     if not HAS_BIAS:
@@ -362,7 +352,6 @@ def triton_conv3d(
         output.stride(3), output.stride(4),
         # 常量
         HAS_BIAS=HAS_BIAS,
-        BLOCK_K=BLOCK_K,
     )
 
     return output

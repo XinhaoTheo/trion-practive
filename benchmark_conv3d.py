@@ -91,17 +91,18 @@ STRIDE = 1
 PADDING = 1   # same padding, 输出尺寸 = 输入尺寸
 
 
-configs = [
+# ---- Benchmark 1: D=H=W 对称, 含大 spatial ----
+configs_symmetric = [
     triton.testing.Benchmark(
-        x_names=["spatial_size"],                           # x 轴参数名
-        x_vals=[8, 12, 16, 20, 24, 28, 32, 40, 48],         # D = H = W 的取值
-        line_arg="provider",                                # 不同 line 对应的参数
-        line_vals=["torch", "triton"],                      # 两条线
-        line_names=["PyTorch (cuDNN)", "Triton"],           # 线的标签
+        x_names=["spatial_size"],
+        x_vals=[8, 16, 24, 32, 48, 64, 80, 96, 128],
+        line_arg="provider",
+        line_vals=["torch", "triton"],
+        line_names=["PyTorch (cuDNN)", "Triton"],
         styles=[("green", "-"), ("blue", "-")],
         ylabel="TFLOPS",
-        xlabel=f"Spatial Size (D=H=W)",
-        plot_name=f"conv3d-performance-N{BATCH_SIZE}-Cin{IN_CHANNELS}-Cout{OUT_CHANNELS}-k{KERNEL_SIZE}",
+        xlabel="Spatial Size (D=H=W)",
+        plot_name=f"conv3d-symmetric-N{BATCH_SIZE}-Cin{IN_CHANNELS}-Cout{OUT_CHANNELS}-k{KERNEL_SIZE}",
         args={
             "N": BATCH_SIZE,
             "C_in": IN_CHANNELS,
@@ -112,13 +113,57 @@ configs = [
 ]
 
 
-@triton.testing.perf_report(configs)
-def benchmark(spatial_size, N, C_in, C_out, K, provider):
-    """Benchmark 单个配置, 返回 TFLOPS。"""
-
+@triton.testing.perf_report(configs_symmetric)
+def benchmark_symmetric(spatial_size, N, C_in, C_out, K, provider):
+    """Benchmark D=H=W 对称场景。"""
     D = H = W = spatial_size
+    return _run_benchmark(N, C_in, C_out, K, D, H, W, provider)
 
-    # 用 FP16 (深度学习标准 dtype, 才能发挥 Tensor Core)
+
+# ---- Benchmark 2: 真实场景非对称 D/H/W ----
+# 模拟视频 (T短, H/W大) 和医学影像 (D/H/W都大) 的典型 shape
+REALISTIC_SHAPES = [
+    # (label, D, H, W, 描述)
+    ("8x56x56",     8,  56,  56),    # 视频模型早期层 (I3D/SlowFast pool 后)
+    ("16x112x112", 16, 112, 112),    # 视频模型 C3D 输入
+    ("32x64x64",   32,  64,  64),    # 医学影像 downsample 后
+    ("8x224x224",   8, 224, 224),    # 视频模型 SlowFast 输入
+    ("64x64x64",   64,  64,  64),    # 医学影像中间层
+    ("128x64x64", 128,  64,  64),    # 医学影像 (D 长)
+    ("32x128x128", 32, 128, 128),    # 医学影像常见
+    ("64x128x128", 64, 128, 128),    # 医学影像大体数据
+]
+
+configs_realistic = [
+    triton.testing.Benchmark(
+        x_names=["shape_idx"],
+        x_vals=list(range(len(REALISTIC_SHAPES))),
+        line_arg="provider",
+        line_vals=["torch", "triton"],
+        line_names=["PyTorch (cuDNN)", "Triton"],
+        styles=[("green", "-"), ("blue", "-")],
+        ylabel="TFLOPS",
+        xlabel="Shape",
+        plot_name=f"conv3d-realistic-N{BATCH_SIZE}-Cin{IN_CHANNELS}-Cout{OUT_CHANNELS}-k{KERNEL_SIZE}",
+        args={
+            "N": BATCH_SIZE,
+            "C_in": IN_CHANNELS,
+            "C_out": OUT_CHANNELS,
+            "K": KERNEL_SIZE,
+        },
+    )
+]
+
+
+@triton.testing.perf_report(configs_realistic)
+def benchmark_realistic(shape_idx, N, C_in, C_out, K, provider):
+    """Benchmark 真实场景非对称 D/H/W。"""
+    label, D, H, W = REALISTIC_SHAPES[shape_idx]
+    return _run_benchmark(N, C_in, C_out, K, D, H, W, provider)
+
+
+def _run_benchmark(N, C_in, C_out, K, D, H, W, provider):
+    """公共 benchmark 逻辑。"""
     x = torch.randn(N, C_in, D, H, W, device=DEVICE, dtype=torch.float16)
     w = torch.randn(C_out, C_in, K, K, K, device=DEVICE, dtype=torch.float16)
     b = torch.randn(C_out, device=DEVICE, dtype=torch.float16)
@@ -142,16 +187,12 @@ def benchmark(spatial_size, N, C_in, C_out, K, provider):
     else:
         raise ValueError(f"未知 provider: {provider}")
 
-    # 计算 FLOPs
-    # 输出尺寸 (same padding, stride=1 所以和输入一样)
     D_out = (D + 2*PADDING - K) // STRIDE + 1
     H_out = (H + 2*PADDING - K) // STRIDE + 1
     W_out = (W + 2*PADDING - K) // STRIDE + 1
 
-    # 2 * N * C_out * (D_out*H_out*W_out) * C_in * K^3
     flops = 2 * N * C_out * D_out * H_out * W_out * C_in * K * K * K
 
-    # TFLOPS = flops / (ms * 1e-3) / 1e12
     perf = lambda ms: flops * 1e-12 / (ms * 1e-3)
     return perf(ms), perf(max_ms), perf(min_ms)
 
@@ -168,17 +209,32 @@ if __name__ == "__main__":
         print("⚠️  正确性测试有失败, 仍然运行 benchmark 供参考")
         print()
 
-    # 2. 跑 benchmark
+    common_info = (f"固定参数: N={BATCH_SIZE}, C_in={IN_CHANNELS}, "
+                   f"C_out={OUT_CHANNELS}, kernel={KERNEL_SIZE}, "
+                   f"stride={STRIDE}, padding={PADDING}")
+
+    # 2. Benchmark 1: 对称 D=H=W (含大 spatial)
     print("=" * 70)
-    print("性能 Benchmark (Triton vs PyTorch cuDNN)")
+    print("Benchmark 1: 对称 D=H=W (Triton vs PyTorch cuDNN)")
     print("=" * 70)
-    print(f"固定参数: N={BATCH_SIZE}, C_in={IN_CHANNELS}, C_out={OUT_CHANNELS}, "
-          f"kernel={KERNEL_SIZE}, stride={STRIDE}, padding={PADDING}")
-    print(f"变化参数: 空间尺寸 D=H=W")
+    print(common_info)
     print()
 
-    benchmark.run(show_plots=False, print_data=True, save_path=".")
+    benchmark_symmetric.run(show_plots=False, print_data=True, save_path=".")
+
+    # 3. Benchmark 2: 真实场景非对称 D/H/W
+    print()
+    print("=" * 70)
+    print("Benchmark 2: 真实场景 (视频 / 医学影像)")
+    print("=" * 70)
+    print(common_info)
+    print("Shapes:")
+    for i, (label, D, H, W) in enumerate(REALISTIC_SHAPES):
+        print(f"  [{i}] {label:>16s}  (D={D}, H={H}, W={W})")
+    print()
+
+    benchmark_realistic.run(show_plots=False, print_data=True, save_path=".")
 
     print()
-    print("📊 结果图已保存到当前目录 (conv3d-performance-*.png)")
+    print("📊 结果图已保存到当前目录 (conv3d-*.png)")
     print("💡 查看图片: 在 VSCode 或 scp 下载后打开")
