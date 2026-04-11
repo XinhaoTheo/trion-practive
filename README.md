@@ -75,6 +75,19 @@ spatial=32 时达到 cuDNN 的 **93%**。
 
 ![Realistic benchmark](conv3d-realistic-N2-Cin32-Cout64-k3.png)
 
+Realistic benchmark 中 X 轴 Shape 编号对应的具体配置：
+
+| Shape | DxHxW | 场景 |
+|-------|-------|------|
+| 0 | 8x56x56 | 视频模型早期层 (I3D/SlowFast pool 后) |
+| 1 | 16x112x112 | 视频模型 C3D 输入 |
+| 2 | 32x64x64 | 医学影像 downsample 后 |
+| 3 | 8x224x224 | 视频模型 SlowFast 输入 |
+| 4 | 64x64x64 | 医学影像中间层 |
+| 5 | 128x64x64 | 医学影像 (D 长) |
+| 6 | 32x128x128 | 医学影像常见 |
+| 7 | 64x128x128 | 医学影像大体数据 |
+
 ## 已知问题
 
 ### Saw-tooth 性能波动
