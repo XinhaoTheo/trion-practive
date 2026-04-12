@@ -89,6 +89,45 @@ Realistic benchmark 中 X 轴 Shape 编号对应的具体配置：
 | 6 | 32x128x128 | 医学影像常见 |
 | 7 | 64x128x128 | 医学影像大体数据 |
 
+## 当前性能分析 (H100)
+
+### 关键数据点
+
+| spatial | cuDNN (TFLOPS) | Triton (TFLOPS) | Triton / cuDNN |
+|---------|----------------|------------------|----------------|
+| 32 | 82.5 | 82.5 | **99%** |
+| 48 | 141.5 | 93.5 | 66% |
+| 64 | 155.9 | 99.8 | 64% |
+| 96 | 167.2 | 103.5 | 62% |
+| 128 | 166.3 | 103.3 | 62% |
+
+### Triton 曲线在 ~103 TFLOPS 封顶
+
+spatial ≥ 64 之后 Triton 吞吐稳定在 ~103 TFLOPS，仅为 H100 FP16 峰值 (756 TFLOPS) 的 **~14%**。瓶颈不在 Tensor Core 本身，而是：
+1. **非 MMA 指令占比高**：每轮 K 循环要做 6 次整除/取模解码 `rk -> (c_in, kd, kh, kw)`、mask 计算、5 次地址乘加
+2. **寄存器压力**：预计算完整 `input_ptrs (BLOCK_K × BLOCK_N)`，BLOCK_N > 128 时 spill 到 local memory，压低 occupancy
+3. **H100 新硬件特性未充分利用**：Triton 编译器对 WGMMA / TMA 的利用可能不如 cuDNN 的手写 SASS
+
+### spatial=32 为什么能打平 cuDNN
+
+两个效应在这一点交汇：
+
+- **Triton 侧**：spatial=32 时 N_gemm = 65,536，按 BLOCK_N=128 有 512 个 block。H100 有 132 SM，一波约 264 block → **wave 数 ≈ 1.9**。还未完全饱和，但已接近 kernel 的算术天花板 (~82 TFLOPS，接近最终 103 的极限)
+- **cuDNN 侧**：问题规模太小，Winograd 的 tile 变换开销摊销不下来，cuDNN 选的是普通 implicit GEMM，**跟 Triton 跑的是同一个算法**
+
+spatial ≥ 48 后 cuDNN 切到 Winograd（理论乘法次数砍到 ~45%），benchmark 按理论 FLOPs 算 TFLOPS 就"虚高" ~2.25x，所以曲线飙到 160+ TFLOPS。**Triton 的 62% 其实是在跟一个算法更优的对手比**。
+
+### Wave 数分析
+
+| spatial | blocks | waves (H100, ~264/wave) | tail 开销占比 |
+|---------|--------|--------------------------|--------------|
+| 32 | 512 | 1.9 | ~25% |
+| 48 | 1,728 | 6.5 | ~8% |
+| 64 | 4,096 | 15.5 | ~3% |
+| 96 | 13,824 | 52 | <2% |
+
+spatial=32 的 wave 数过少导致 warmup/cooldown 摊销不开，spatial ≥ 64 后 tail 影响可忽略，kernel 吞吐平在本身的算术瓶颈上。
+
 ## 已知问题
 
 ### Saw-tooth 性能波动
