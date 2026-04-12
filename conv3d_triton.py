@@ -1,26 +1,26 @@
 """
-Triton Conv3d 实现
+Triton Conv3d Implementation
 =======================================================
 
-学习路径: Vector Add → MatMul → im2col + MatMul = Conv3d
+Learning path: Vector Add -> MatMul -> im2col + MatMul = Conv3d
 
-核心思想:
-    Conv3d 可以通过 im2col 变换转化为矩阵乘法问题:
-    1. 将输入展开为 im2col 矩阵 (implicit GEMM, 不真正物化)
-    2. 对展开的输入和权重做矩阵乘法
-    3. 得到输出
+Core idea:
+    Conv3d can be converted to matrix multiplication via im2col:
+    1. Expand input into an im2col matrix (implicit GEMM, not actually materialized)
+    2. Multiply the expanded input with the weights
+    3. Produce the output
 
-PyTorch Conv3d 公式:
+PyTorch Conv3d formula:
     out(N_i, C_out_j) = bias(C_out_j) +
-        sum_{k=0}^{C_in-1} weight(C_out_j, k) ★ input(N_i, k)
+        sum_{k=0}^{C_in-1} weight(C_out_j, k) * input(N_i, k)
 
-    其中 ★ 是 3D 互相关操作 (cross-correlation)
+    where * is the 3D cross-correlation operation
 
-输入形状: (N, C_in, D_in, H_in, W_in)
-权重形状: (C_out, C_in, kD, kH, kW)
-输出形状: (N, C_out, D_out, H_out, W_out)
+Input shape:  (N, C_in, D_in, H_in, W_in)
+Weight shape: (C_out, C_in, kD, kH, kW)
+Output shape: (N, C_out, D_out, H_out, W_out)
 
-其中:
+where:
     D_out = (D_in + 2*pad_d - kD) // stride_d + 1
     H_out = (H_in + 2*pad_h - kH) // stride_h + 1
     W_out = (W_in + 2*pad_w - kW) // stride_w + 1
@@ -31,53 +31,43 @@ import triton
 import triton.language as tl
 
 # ============================================================================
-# 第一步: 理解 Triton 基础 (来自 Vector Add 教程)
-# ============================================================================
-# Triton 的核心概念:
-# 1. @triton.jit — 标记一个函数为 Triton kernel
-# 2. tl.program_id(axis) — 获取当前 program 的 ID (类似 CUDA 的 blockIdx)
-# 3. tl.arange(0, N) — 生成 [0, 1, ..., N-1] 的向量
-# 4. tl.load / tl.store — 从 DRAM 加载/存储数据
-# 5. tl.dot — 块级矩阵乘法 (Triton 的核心优势)
-# 6. tl.constexpr — 编译时常量 (block size 等)
-
-# ============================================================================
-# 第二步: 理解 Conv3d → GEMM 的转换
+# Step 1: Conv3d -> GEMM conversion
 # ============================================================================
 #
-# === Implicit GEMM 方法 ===
+# === Implicit GEMM method ===
 #
-# 我们把 Conv3d 看成一个大矩阵乘法:
+# We treat Conv3d as a big matrix multiplication:
 #
-# 矩阵 A (权重): shape = (C_out, C_in * kD * kH * kW)
-#   - 每一行是一个输出通道的所有权重展平
+# Matrix A (weights): shape = (C_out, C_in * kD * kH * kW)
+#   - every row corresponds to one output channel, containing all weights for that channel
 #
-# 矩阵 B (im2col 展开的输入): shape = (C_in * kD * kH * kW, N * D_out * H_out * W_out)
-#   - 每一列对应一个输出位置, 包含该位置卷积窗口内所有输入值
+# Matrix B (im2col expanded input): shape = (C_in * kD * kH * kW, N * D_out * H_out * W_out)
+#   - every column corresponds to one output position, containing all input values in that convolutional window
 #
-# 矩阵 C (输出): shape = (C_out, N * D_out * H_out * W_out)
+# Matrix C (output): shape = (C_out, N * D_out * H_out * W_out)
 #   - C = A @ B
-#   - 然后 reshape 为 (N, C_out, D_out, H_out, W_out)
+#   - then reshape to (N, C_out, D_out, H_out, W_out)
 #
-# 关键优化: 我们不真正创建 im2col 矩阵 (太大了!),
-# 而是在 kernel 内部通过索引计算 "隐式" 地访问对应位置。
+# Key optimization: we don't actually create the im2col matrix in memory
+# (which would be huge and sparse),
+# we access it through index calculation.
 
 
 # ============================================================================
-# 第三步: Triton Conv3d Kernel
+# Step 2: Triton Conv3d Kernel
 # ============================================================================
 #
-# Autotune configs: Triton 会在这些配置中搜索最优的一个
-# - BLOCK_M/N/K: tile 大小, 越大 Tensor Core 利用率越高, 但占用更多 shared memory
-# - num_warps: 每个 program 用多少 warp (32 线程一组), 一般 4 或 8
-# - num_stages: 软件流水线深度, 越大延迟隐藏越好但占更多寄存器
+# Autotune configs: Triton will choose the most optimized one based on input size and GPU architecture.
+# - BLOCK_M/N/K: tile size, Tensor Core, more shared memory
+# - num_warps: every program uses this many warps (usually 4 or 8) (every warp 32 threads)
+# - num_stages: pipelining stages for better latency hiding, usually 2-4
 #
 # key=["out_channels", "in_channels", "out_depth", "out_height", "out_width",
 #      "kernel_d", "kernel_h", "kernel_w"]:
-#   这些参数变化时, autotune 会重新搜索最优配置 (并缓存结果)
+#   when these parameters change, the optimal config may change, so we need to re-autotune.
 
 def get_autotune_configs():
-    """autotune BLOCK_M/N/K + GROUP_SIZE_M。"""
+    """Autotune BLOCK_M/N/K + GROUP_SIZE_M."""
     configs = []
     for BM in [32, 64, 128]:
         for BN in [32, 64, 128]:
@@ -108,13 +98,13 @@ def get_autotune_configs():
 )
 @triton.jit
 def conv3d_kernel(
-    # === 指针 ===
-    input_ptr,      # 已预先 zero-pad 的输入, shape: (N, C_in, D_pad, H_pad, W_pad)
-    weight_ptr,     # 2D 展平的权重, shape: (C_out, C_in * kD * kH * kW)
-    bias_ptr,       # 偏置指针, shape: (C_out,), 可以为 None
-    output_ptr,     # 输出张量指针, shape: (N, C_out, D_out, H_out, W_out)
+    # Pointers
+    input_ptr,      # Pre-zero-padded input, shape: (N, C_in, D_pad, H_pad, W_pad)
+    weight_ptr,     # 2D flattened weights, shape: (C_out, C_in * kD * kH * kW)
+    bias_ptr,       # Bias pointer, shape: (C_out,), can be None
+    output_ptr,     # Output tensor pointer, shape: (N, C_out, D_out, H_out, W_out)
 
-    # === 维度 ===
+    # Dimensions 
     batch_size,     # N
     in_channels,    # C_in
     out_channels,   # C_out
@@ -122,79 +112,80 @@ def conv3d_kernel(
     out_height,     # H_out
     out_width,      # W_out
 
-    # === 卷积核尺寸 ===
+    # Kernel size
     kernel_d,       # kD
     kernel_h,       # kH
     kernel_w,       # kW
 
-    # === conv stride ===
+    # Conv stride
     stride_d,
     stride_h,
     stride_w,
 
-    # === 输入张量的 stride (已 pad 后的内存步长) ===
+    # Input tensor stride (post-pad memory stride)
     input_stride_n,
     input_stride_c,
     input_stride_d,
     input_stride_h,
     input_stride_w,
 
-    # === 权重张量的 stride (2D: 只需 oc 方向) ===
+    # Weight tensor stride (2D: only oc direction needed)
     weight_stride_oc,
 
-    # === 输出张量的 stride ===
+    # Output tensor stride
     output_stride_n,
     output_stride_c,
     output_stride_d,
     output_stride_h,
     output_stride_w,
 
-    # === 常量 ===
+    # Constants 
     HAS_BIAS: tl.constexpr,
-    BLOCK_M: tl.constexpr,      # 输出通道方向的 block
-    BLOCK_N: tl.constexpr,      # 输出空间位置方向的 block
-    BLOCK_K: tl.constexpr,      # reduction 方向的 block, autotune 搜索
+    BLOCK_M: tl.constexpr,      # Block along output channel direction
+    BLOCK_N: tl.constexpr,      # Block along output spatial position direction
+    BLOCK_K: tl.constexpr,      # Block along reduction direction, searched by autotune
     GROUP_SIZE_M: tl.constexpr,
 ):
     """
-    Conv3d 的 Triton kernel, 使用 implicit GEMM 方法。
+    Triton kernel for Conv3d using the implicit GEMM method.
 
-    GEMM 视角:
-        M = C_out                           (输出通道数)
-        N = batch_size * D_out * H_out * W_out   (所有输出空间位置)
-        K = C_in * kD * kH * kW             (reduction 维度)
+    GEMM view:
+        M = C_out                                (number of output channels)
+        N = batch_size * D_out * H_out * W_out   (all output spatial positions)
+        K = C_in * kD * kH * kW                  (reduction dimension)
 
-    每个 Triton program 计算输出矩阵 C 的一个 (BLOCK_M, BLOCK_N) 的块。
+    Each Triton program computes a (BLOCK_M, BLOCK_N) block of the output matrix C.
     """
 
-    # ----- 1. 确定当前 program 负责的输出块 -----
-    # 使用 1D launch grid, 需要手动映射到 2D (M, N)
+    # ----- 1. Determine which output block this program is responsible for -----
+    # Using a 1D launch grid, need to manually map to 2D (M, N)
     pid = tl.program_id(axis=0)
 
-    # 总共有多少个 program 沿 M 和 N 方向
+    # Total number of programs along M and N directions
     num_pid_m = tl.cdiv(out_channels, BLOCK_M)
     num_pid_n = tl.cdiv(batch_size * out_depth * out_height * out_width, BLOCK_N)
 
-    # 映射: pid -> (pid_m, pid_n), 使用 grouped ordering 优化 L2 cache
-    # 把 program 按 GROUP_SIZE_M 行打包成一个 "super-group", 在 group 内
-    # 先沿 M 方向走, 走完再换列, 这样同时活跃的 program 落在一个正方形里,
-    # 共享更多的 input/weight tile, 显著提升 L2 命中率。
+    # Mapping: pid -> (pid_m, pid_n), using grouped ordering to optimize L2 cache.
+    # Pack programs into "super-groups" of GROUP_SIZE_M rows. Within a group,
+    # walk along M first, then switch columns. This way, simultaneously active
+    # programs land in a square region, sharing more input/weight tiles and
+    # significantly improving L2 hit rate.
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
     group_id = pid // num_pid_in_group
     first_pid_m = group_id * GROUP_SIZE_M
-    # 处理最后一个 group 不满 GROUP_SIZE_M 行的情况
+    # Handle the last group not being full GROUP_SIZE_M rows
     group_size_m = tl.minimum(num_pid_m - first_pid_m, GROUP_SIZE_M)
     pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
     pid_n = (pid % num_pid_in_group) // group_size_m
 
-    # ----- 2. 计算当前 block 的输出通道索引和空间位置索引 -----
+    # ----- 2. Compute output channel indices and spatial position indices for this block -----
     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)   # (BLOCK_M,)
     rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)   # (BLOCK_N,)
 
     out_spatial = out_depth * out_height * out_width
     total_out = batch_size * out_spatial
 
-    # 从 rn 解码出 (n, d_out, h_out, w_out)
+    # Decode (n, d_out, h_out, w_out) from rn
     n_idx = rn // out_spatial
     spatial_idx = rn % out_spatial
     d_out_idx = spatial_idx // (out_height * out_width)
@@ -202,7 +193,7 @@ def conv3d_kernel(
     h_out_idx = hw_idx // out_width
     w_out_idx = hw_idx % out_width
 
-    # ----- 3. Reduction 循环: 沿 K = C_in * kD * kH * kW 累加 -----
+    # ----- 3. Reduction loop: accumulate along K = C_in * kD * kH * kW -----
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
     K = in_channels * kernel_d * kernel_h * kernel_w
@@ -212,7 +203,7 @@ def conv3d_kernel(
     for k_start in range(0, K, BLOCK_K):
         rk = k_start + tl.arange(0, BLOCK_K)   # (BLOCK_K,)
 
-        # 从 rk 解码出 (c_in, kd, kh, kw)
+        # Decode (c_in, kd, kh, kw) from rk
         rk_c = rk // KDHW
         rk_rem = rk % KDHW
         rk_d = rk_rem // KHW
@@ -220,14 +211,14 @@ def conv3d_kernel(
         rk_h = rk_hk // kernel_w
         rk_w = rk_hk % kernel_w
 
-        # 加载权重 (2D layout: weight_ptr + rm * stride_oc + rk)
+        # Load weights (2D layout: weight_ptr + rm * stride_oc + rk)
         weight_ptrs = (weight_ptr
                       + rm[:, None] * weight_stride_oc
                       + rk[None, :])
         weight_mask = (rm[:, None] < out_channels) & (rk[None, :] < K)
         w = tl.load(weight_ptrs, mask=weight_mask, other=0.0)
 
-        # 加载输入 (已预先 zero-pad, 不需要 d/h/w 范围检查)
+        # Load input (pre-zero-padded, no d/h/w range check needed)
         d_in = d_out_idx[None, :] * stride_d + rk_d[:, None]
         h_in = h_out_idx[None, :] * stride_h + rk_h[:, None]
         w_in = w_out_idx[None, :] * stride_w + rk_w[:, None]
@@ -243,12 +234,12 @@ def conv3d_kernel(
 
         acc = tl.dot(w, x, acc)
 
-    # ----- 4. bias -----
+    # ----- 4. Bias -----
     if HAS_BIAS:
         bias = tl.load(bias_ptr + rm, mask=rm < out_channels, other=0.0)
         acc += bias[:, None]
 
-    # ----- 5. store -----
+    # ----- 5. Store -----
     c_out = acc.to(output_ptr.dtype.element_ty)
 
     output_ptrs = (output_ptr
@@ -263,7 +254,7 @@ def conv3d_kernel(
 
 
 # ============================================================================
-# 第四步: Python Wrapper 函数
+# Step 3: Python Wrapper
 # ============================================================================
 
 def triton_conv3d(
@@ -274,50 +265,50 @@ def triton_conv3d(
     padding: tuple = (0, 0, 0),
 ) -> torch.Tensor:
     """
-    使用 Triton 实现的 Conv3d, 对标 torch.nn.Conv3d。
+    Conv3d implemented in Triton, matching torch.nn.Conv3d.
 
-    参数:
-        input:   (N, C_in, D_in, H_in, W_in) 输入张量
-        weight:  (C_out, C_in, kD, kH, kW) 卷积核
-        bias:    (C_out,) 偏置, 可选
+    Args:
+        input:   (N, C_in, D_in, H_in, W_in) input tensor
+        weight:  (C_out, C_in, kD, kH, kW) conv kernel
+        bias:    (C_out,) bias, optional
         stride:  (stride_d, stride_h, stride_w)
         padding: (pad_d, pad_h, pad_w)
 
-    返回:
+    Returns:
         output:  (N, C_out, D_out, H_out, W_out)
     """
-    # --- 检查输入 ---
-    assert input.is_contiguous(), "输入必须是 contiguous 的"
-    assert weight.is_contiguous(), "权重必须是 contiguous 的"
-    assert input.ndim == 5, f"输入必须是 5D 张量, 但得到 {input.ndim}D"
-    assert weight.ndim == 5, f"权重必须是 5D 张量, 但得到 {weight.ndim}D"
+    # --- Validate input ---
+    assert input.is_contiguous(), "input must be contiguous"
+    assert weight.is_contiguous(), "weight must be contiguous"
+    assert input.ndim == 5, f"input must be a 5D tensor, got {input.ndim}D"
+    assert weight.ndim == 5, f"weight must be a 5D tensor, got {weight.ndim}D"
 
     N, C_in, D_in, H_in, W_in = input.shape
     C_out, C_in_w, kD, kH, kW = weight.shape
-    assert C_in == C_in_w, f"输入通道 {C_in} != 权重输入通道 {C_in_w}"
+    assert C_in == C_in_w, f"input channels {C_in} != weight input channels {C_in_w}"
 
     stride_d, stride_h, stride_w = stride
     pad_d, pad_h, pad_w = padding
 
-    # --- 计算输出尺寸 ---
+    # --- Compute output size ---
     D_out = (D_in + 2 * pad_d - kD) // stride_d + 1
     H_out = (H_in + 2 * pad_h - kH) // stride_h + 1
     W_out = (W_in + 2 * pad_w - kW) // stride_w + 1
 
     assert D_out > 0 and H_out > 0 and W_out > 0, \
-        f"输出尺寸无效: ({D_out}, {H_out}, {W_out})"
+        f"invalid output size: ({D_out}, {H_out}, {W_out})"
 
-    # === 优化 A: 显式 zero-pad 输入, kernel 内不再需要 d/h/w 的 mask ===
+    # === Optimization A: explicitly zero-pad input, kernel no longer needs d/h/w mask ===
     if pad_d > 0 or pad_h > 0 or pad_w > 0:
         input = torch.nn.functional.pad(
             input, (pad_w, pad_w, pad_h, pad_h, pad_d, pad_d)
         )
-    # input 现在是 (N, C_in, D_in+2*pad_d, H_in+2*pad_h, W_in+2*pad_w)
+    # input is now (N, C_in, D_in+2*pad_d, H_in+2*pad_h, W_in+2*pad_w)
 
-    # === 优化 C: weight reshape 成 2D, 消除 kernel 内的 4 个 stride 计算 ===
-    weight_2d = weight.view(C_out, -1)   # (C_out, C_in*kD*kH*kW), 共享内存
+    # === Optimization C: reshape weight to 2D, eliminating 4 stride computations in the kernel ===
+    weight_2d = weight.view(C_out, -1)   # (C_out, C_in*kD*kH*kW), shared memory
 
-    # --- 分配输出 ---
+    # --- Allocate output ---
     output = torch.empty(
         (N, C_out, D_out, H_out, W_out),
         device=input.device, dtype=input.dtype
@@ -326,7 +317,7 @@ def triton_conv3d(
     M = C_out
     total_N = N * D_out * H_out * W_out
 
-    # --- 准备 bias ---
+    # --- Prepare bias ---
     HAS_BIAS = bias is not None
     if not HAS_BIAS:
         bias = torch.empty(0, device=input.device, dtype=input.dtype)
@@ -337,20 +328,20 @@ def triton_conv3d(
 
     conv3d_kernel[grid](
         input, weight_2d, bias, output,
-        # 维度
+        # Dimensions
         N, C_in,
         C_out, D_out, H_out, W_out,
         kD, kH, kW,
         stride_d, stride_h, stride_w,
-        # 输入 stride (来自 padded 后的 input)
+        # Input stride (from padded input)
         input.stride(0), input.stride(1), input.stride(2),
         input.stride(3), input.stride(4),
-        # 权重 stride (2D, 只需 oc 方向)
+        # Weight stride (2D, only oc direction)
         weight_2d.stride(0),
-        # 输出 stride
+        # Output stride
         output.stride(0), output.stride(1), output.stride(2),
         output.stride(3), output.stride(4),
-        # 常量
+        # Constants
         HAS_BIAS=HAS_BIAS,
     )
 
@@ -358,64 +349,64 @@ def triton_conv3d(
 
 
 # ============================================================================
-# 第五步: 测试 — 对比 PyTorch 结果
+# Step 4: Tests — compare against PyTorch
 # ============================================================================
 
 def test_conv3d():
-    """测试 Triton Conv3d 是否和 PyTorch Conv3d 结果一致。"""
+    """Test that Triton Conv3d matches PyTorch Conv3d results."""
 
     torch.manual_seed(42)
     device = 'cuda'
     dtype = torch.float32
 
-    # 打印 GPU 信息
+    # Print GPU info
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print(f"Capability: {torch.cuda.get_device_capability(0)}")
     print()
 
-    # --- 测试用例 ---
+    # --- Test cases ---
     test_cases = [
-        # (N, C_in, D, H, W, C_out, kD, kH, kW, stride, padding, use_bias, 描述)
+        # (N, C_in, D, H, W, C_out, kD, kH, kW, stride, padding, use_bias, description)
         (1, 1, 4, 4, 4, 1, 3, 3, 3, (1,1,1), (0,0,0), False,
-         "最简单: 单 batch, 单通道, 无 padding"),
+         "simplest: single batch, single channel, no padding"),
 
         (1, 1, 4, 4, 4, 1, 3, 3, 3, (1,1,1), (1,1,1), False,
-         "加 padding"),
+         "with padding"),
 
         (1, 3, 8, 8, 8, 16, 3, 3, 3, (1,1,1), (1,1,1), True,
-         "多通道 + bias"),
+         "multi-channel + bias"),
 
         (2, 3, 8, 8, 8, 16, 3, 3, 3, (2,2,2), (1,1,1), True,
          "stride=2 + bias"),
 
         (2, 16, 8, 8, 8, 32, 3, 3, 3, (1,1,1), (1,1,1), True,
-         "更大的通道数"),
+         "larger channel count"),
     ]
 
     print("=" * 70)
-    print("Triton Conv3d 正确性测试")
+    print("Triton Conv3d correctness test")
     print("=" * 70)
 
     all_passed = True
     for (N, C_in, D, H, W, C_out, kD, kH, kW,
          stride, padding, use_bias, desc) in test_cases:
 
-        # 创建输入
+        # Create input
         x = torch.randn(N, C_in, D, H, W, device=device, dtype=dtype)
         w = torch.randn(C_out, C_in, kD, kH, kW, device=device, dtype=dtype)
         b = torch.randn(C_out, device=device, dtype=dtype) if use_bias else None
 
-        # PyTorch 参考结果
+        # PyTorch reference result
         torch_out = torch.nn.functional.conv3d(x, w, b, stride=stride, padding=padding)
 
-        # Triton 结果
+        # Triton result
         triton_out = triton_conv3d(x, w, b, stride=stride, padding=padding)
 
-        # 比较 (TF32 精度容差: ~1e-2, 符合 Tensor Core 实际表现)
+        # Compare (TF32 tolerance: ~1e-2, matches actual Tensor Core behavior)
         max_diff = (torch_out - triton_out).abs().max().item()
         passed = torch.allclose(torch_out, triton_out, atol=1e-2, rtol=1e-2)
 
-        status = "✅ PASS" if passed else "❌ FAIL"
+        status = "PASS" if passed else "FAIL"
         print(f"{status} | {desc}")
         print(f"       shape: ({N},{C_in},{D},{H},{W}) -> ({N},{C_out},"
               f"{torch_out.shape[2]},{torch_out.shape[3]},{torch_out.shape[4]})")
@@ -426,59 +417,11 @@ def test_conv3d():
 
     print("=" * 70)
     if all_passed:
-        print("🎉 所有测试通过!")
+        print("All tests passed!")
     else:
-        print("⚠️  部分测试失败, 请检查实现")
+        print("Some tests failed, please check the implementation")
     print("=" * 70)
 
 
-# ============================================================================
-# 第六步: 学习笔记总结
-# ============================================================================
-
-LEARNING_NOTES = """
-╔══════════════════════════════════════════════════════════════════════╗
-║                    Triton Conv3d 学习路线图                          ║
-╠══════════════════════════════════════════════════════════════════════╣
-║                                                                      ║
-║  1. 先学 Vector Add (01-vector-add)                                  ║
-║     → 理解 program_id, arange, load/store, mask                      ║
-║                                                                      ║
-║  2. 再学 MatMul (03-matrix-multiplication)                           ║
-║     → 理解 tl.dot, 多维指针算术, L2 cache 优化                       ║
-║     → 理解 blocked accumulation (K方向循环)                          ║
-║                                                                      ║
-║  3. Conv3d = Implicit GEMM                                           ║
-║     → 不物化 im2col 矩阵, 通过索引计算隐式展开                       ║
-║     → M = C_out, N = batch*D_out*H_out*W_out, K = C_in*kD*kH*kW     ║
-║     → kernel 内部: 从线性索引 → (n, d, h, w) → 计算输入地址           ║
-║                                                                      ║
-║  ──── 关键 Triton API ────                                           ║
-║  tl.program_id(0)      : 获取 block ID                               ║
-║  tl.arange(0, N)       : 创建 [0..N-1] 向量                          ║
-║  tl.load(ptr, mask)    : 带 mask 的内存加载                           ║
-║  tl.store(ptr, val)    : 写回内存                                     ║
-║  tl.dot(a, b, acc)     : 块矩阵乘法, 累加到 acc                      ║
-║  tl.zeros(shape, dtype): 初始化全零张量                               ║
-║  tl.cdiv(a, b)         : 向上取整除法                                 ║
-║                                                                      ║
-║  ──── Conv3d 中的难点 ────                                           ║
-║  1. 从 rk (reduction索引) 解码出 (c_in, kd, kh, kw)                  ║
-║  2. 从 rn (空间索引) 解码出 (n, d_out, h_out, w_out)                  ║
-║  3. 计算对应的输入位置: d_in = d_out*stride - pad + kd               ║
-║  4. Padding mask: 判断输入位置是否在有效范围内                        ║
-║                                                                      ║
-║  ──── 优化方向 ────                                                  ║
-║  • @triton.autotune 搜索最优 BLOCK_M/N/K                             ║
-║  • L2 cache 优化 (grouped ordering)                                  ║
-║  • 支持 dilation, groups                                             ║
-║  • FP16 / BF16 精度                                                  ║
-║  • 反向传播 kernel (backward pass)                                   ║
-║                                                                      ║
-╚══════════════════════════════════════════════════════════════════════╝
-"""
-
-
 if __name__ == "__main__":
-    print(LEARNING_NOTES)
     test_conv3d()
