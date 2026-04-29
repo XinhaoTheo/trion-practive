@@ -157,7 +157,7 @@ def conv3d_kernel(
     Each Triton program computes a (BLOCK_M, BLOCK_N) block of the output matrix C.
     """
 
-    # ----- 1. Determine which output block this program is responsible for -----
+    # 1. Determine which output block this program is responsible for
     # Using a 1D launch grid, need to manually map to 2D (M, N)
     pid = tl.program_id(axis=0)
 
@@ -165,11 +165,9 @@ def conv3d_kernel(
     num_pid_m = tl.cdiv(out_channels, BLOCK_M)
     num_pid_n = tl.cdiv(batch_size * out_depth * out_height * out_width, BLOCK_N)
 
-    # Mapping: pid -> (pid_m, pid_n), using grouped ordering to optimize L2 cache.
-    # Pack programs into "super-groups" of GROUP_SIZE_M rows. Within a group,
-    # walk along M first, then switch columns. This way, simultaneously active
-    # programs land in a square region, sharing more input/weight tiles and
-    # significantly improving L2 hit rate.
+    # Mapping: pid -> (pid_m, pid_n), using grouped ordering.
+    # GROUP_SIZE_M rows. Within a group,
+    # row along M first, then switch columns.
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
     group_id = pid // num_pid_in_group
     first_pid_m = group_id * GROUP_SIZE_M
@@ -178,7 +176,7 @@ def conv3d_kernel(
     pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
     pid_n = (pid % num_pid_in_group) // group_size_m
 
-    # ----- 2. Compute output channel indices and spatial position indices for this block -----
+    # 2. Compute output channel indices and spatial position indices for this block 
     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)   # (BLOCK_M,)
     rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)   # (BLOCK_N,)
 
@@ -193,7 +191,7 @@ def conv3d_kernel(
     h_out_idx = hw_idx // out_width
     w_out_idx = hw_idx % out_width
 
-    # ----- 3. Reduction loop: accumulate along K = C_in * kD * kH * kW -----
+    # 3. Reduction loop: accumulate along K = C_in * kD * kH * kW 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
     K = in_channels * kernel_d * kernel_h * kernel_w
@@ -234,12 +232,12 @@ def conv3d_kernel(
 
         acc = tl.dot(w, x, acc)
 
-    # ----- 4. Bias -----
+    # 4. Add bias if we have
     if HAS_BIAS:
         bias = tl.load(bias_ptr + rm, mask=rm < out_channels, other=0.0)
         acc += bias[:, None]
 
-    # ----- 5. Store -----
+    # 5. Store back
     c_out = acc.to(output_ptr.dtype.element_ty)
 
     output_ptrs = (output_ptr
